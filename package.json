@@ -1,1 +1,1 @@
-{"type":"module"}
+{"description":"A fast Markdown to HTML engine that renders exactly what marked 18.1.3 renders with default options.","license":"MIT","name":"fleetmark","private":true,"type":"module","version":"1.0.0"}

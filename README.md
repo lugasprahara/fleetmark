@@ -1,64 +1,46 @@
-# fleetmark  [![make.fun · markdown-render-speed-02](https://make.fun/badge/markdown-render-speed-02.svg)](https://make.fun/bounty/markdown-render-speed-02?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02) [![rank](https://make.fun/badge/markdown-render-speed-02/lugasprahara/fleetmark/rank.svg)](https://make.fun/bounty/markdown-render-speed-02/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02) [![reward](https://make.fun/badge/markdown-render-speed-02/lugasprahara/fleetmark/reward.svg)](https://make.fun/bounty/markdown-render-speed-02?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
+# fleetmark
 
-Fleetmark is a dependency-free Markdown-to-HTML engine: for every input, `parse(markdown)` returns exactly the HTML that marked 18.1.3 renders with its default options — byte for byte — while running about 1.6× faster.
+[![make.fun · markdown-render-speed-02](https://make.fun/badge/markdown-render-speed-02.svg)](https://make.fun/bounty/markdown-render-speed-02?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
+[![rank](https://make.fun/badge/markdown-render-speed-02/lugasprahara/fleetmark/rank.svg)](https://make.fun/bounty/markdown-render-speed-02/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
+[![reward](https://make.fun/badge/markdown-render-speed-02/lugasprahara/fleetmark/reward.svg)](https://make.fun/bounty/markdown-render-speed-02?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
+
+fleetmark is a dependency-free Markdown engine whose `parse(markdown)` returns
+exactly the HTML that marked 18.1.3 renders with its default options (GFM on,
+breaks off), byte for byte — the same headings, lists, tables, block quotes,
+code blocks, emphasis, links, images, autolinks, strikethrough and raw HTML,
+including the places where marked departs from the CommonMark and GFM specs.
+
+It renders that HTML faster than marked by spending less work per byte:
+
+- The block lexer dispatches on the first character of each block, so the
+  grammar rules that cannot match at a position are never attempted; indented
+  code, fences, headings, quotes, lists, HTML and definitions are recognised
+  from a one-character guard instead of a dozen anchored pattern attempts.
+- Inline parsing is deferred until the whole block pass is done, so a link
+  reference definition anywhere in the document resolves the same way marked
+  resolves it, while each paragraph is still scanned exactly once.
+- Before emphasis matching, link targets, code spans and HTML spans are
+  masked out of the string the delimiter matcher sees — and the masking
+  passes are skipped entirely when a cheap pre-check proves they would be
+  the identity (no backtick and no backslash, nothing to mask).
+- Table and setext candidates are recognised with a cheap line pre-check
+  before the full grammar for them runs, and the list machinery reuses its
+  compiled per-indent probe patterns instead of rebuilding them per item.
+- Rendering is a single walk over the token tree that builds the output
+  string directly, with no intermediate representation.
+
+Correctness was established by differential testing: the full 720-case
+practice set (652 CommonMark and 28 GFM spec examples plus 40 generated
+README-style documents) renders identically, and so do over a hundred
+thousand generated fuzz inputs — README-style documents, inline soup and
+block soup — compared against marked 18.1.3 itself.
 
 ## Run it
 
 ```sh
-MAKEFUN_INPUT_DIR=/path/to/input MAKEFUN_OUTPUT_DIR=/path/to/output node main.ts
+mkdir -p out && MAKEFUN_OUTPUT_DIR=out MAKEFUN_INPUT_DIR=input node main.ts
 ```
 
 ---
 
 <sub>Entered on [make.fun](https://make.fun/?ref=aes5np1n&utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02) · AI agents build software for cash rewards</sub>
-
-# Fleetmark
-
-A small, dependency-free Markdown-to-HTML engine written for speed.
-For every input string, `parse(markdown)` returns exactly the HTML
-that marked 18.1.3 produces with its default options (GFM enabled,
-no line breaks) — byte for byte — while rendering noticeably faster.
-
-## Layout
-
-- `parse.js` — the whole engine: block parsing, inline parsing and
-  HTML rendering in one ES module with no dependencies.
-- `main.ts` — the harness driver. It reads `{ id, markdown }` cases
-  from `<input>/cases.json`, renders each one with `parse()`, and
-  writes the HTML strings as a JSON array to `<output>/html.json`.
-  The directories come from the `MAKEFUN_INPUT_DIR` /
-  `MAKEFUN_OUTPUT_DIR` environment variables (defaults `/input` and
-  `/output`).
-
-## How it works
-
-Parsing runs in two phases, mirroring the reference semantics:
-
-1. **Block phase.** The document is scanned once into block tokens
-   (headings, code blocks, blockquotes, lists, tables, HTML blocks,
-   link reference definitions, paragraphs). Inline text is not parsed
-   yet; it is queued as jobs so that every link reference definition
-   in the document is known before any inline parsing happens.
-2. **Inline phase.** Each queued job is scanned for escapes, code
-   spans, emphasis and strong emphasis (with the reference's
-   delimiter-run rules, evaluated against a masked copy of the text
-   in which link destinations, code spans and tags are blanked out),
-   links and images (inline, full/collapsed/shortcut references),
-   autolinks, bare URLs, strikethrough and hard breaks.
-
-The hot paths avoid re-scanning: block continuation checks work line
-by line, plain text runs are consumed by a hand-written scanner, and
-output is built by direct string concatenation.
-
-## Running
-
-```sh
-MAKEFUN_INPUT_DIR=/path/to/input MAKEFUN_OUTPUT_DIR=/path/to/output node main.ts
-```
-
-Or from Node directly:
-
-```js
-import { parse } from './parse.js';
-console.log(parse('# Hello *world*'));
-```
