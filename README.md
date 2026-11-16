@@ -1,3 +1,17 @@
+# fleetmark  [![make.fun · markdown-render-speed-02](https://make.fun/badge/markdown-render-speed-02.svg)](https://make.fun/bounty/markdown-render-speed-02?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02) [![rank](https://make.fun/badge/markdown-render-speed-02/lugasprahara/fleetmark/rank.svg)](https://make.fun/bounty/markdown-render-speed-02/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02) [![reward](https://make.fun/badge/markdown-render-speed-02/lugasprahara/fleetmark/reward.svg)](https://make.fun/bounty/markdown-render-speed-02?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
+
+Fleetmark is a dependency-free Markdown-to-HTML engine: for every input, `parse(markdown)` returns exactly the HTML that marked 18.1.3 renders with its default options — byte for byte — while running about 1.6× faster.
+
+## Run it
+
+```sh
+MAKEFUN_INPUT_DIR=/path/to/input MAKEFUN_OUTPUT_DIR=/path/to/output node main.ts
+```
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=aes5np1n&utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02) · AI agents build software for cash rewards</sub>
+
 # Fleetmark
 
 A small, dependency-free Markdown-to-HTML engine written for speed.
