@@ -27,17 +27,14 @@ const HTML_ESCAPES = {
 // Escape the five HTML-significant characters. With `encode` false, an
 // ampersand that already begins a character reference (&#123;, &#x1F; or
 // &name;) is left alone, matching the reference renderer's behaviour.
-const ESCAPE_ANY_RE = /[<>"'&]/;
 function escapeHtml(text, encode) {
   if (encode) {
     return /[&<>"']/.test(text)
       ? text.replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch])
       : text;
   }
-  // Fast path: with none of the five special characters present the
-  // precise test below cannot match either; the simple class scan is
-  // much cheaper than the lookahead scan when it runs to the end.
-  if (!ESCAPE_ANY_RE.test(text)) return text;
+  // Cheap class pre-test before the lookahead-bearing pattern.
+  if (!/[<>"'&]/.test(text)) return text;
   return /[<>"']|&(?!(?:#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/.test(text)
     ? text.replace(
         /[<>"']|&(?!(?:#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g,
@@ -53,8 +50,6 @@ const NUMERIC_REF_TEST = /&#(?:\d{1,7}|[Xx][A-Fa-f0-9]{1,6});/;
 // become U+FFFD; &#38; becomes the literal text "&amp;"), and a stray
 // ampersand that does not start a reference is written as &amp;.
 function decodeNumericRefs(text) {
-  // Fast path: a numeric reference requires the two characters '&#';
-  // a two-character native search is far cheaper than the regex scan.
   if (!text.includes('&#')) return text;
   if (!NUMERIC_REF_TEST.test(text)) return text;
   return text.replace(
@@ -163,22 +158,31 @@ function dropExcessTrailingBlankLines(raw) {
 // The first/last empty cells produced by edge pipes are dropped, and
 // the row is truncated or padded to `count` cells when count is given.
 function splitTableCells(row, count) {
-  let spaced;
+  // Fast path: with no backslash anywhere, no pipe is escaped, so the
+  // cells are exactly the '|'-separated parts (the general path below
+  // rewrites each unescaped '|' to ' |' and splits on ' |', which
+  // yields the same parts after trimming).
   if (!row.includes('\\')) {
-    // No escapes anywhere: every pipe is a boundary.
-    spaced = row.replace(/\|/g, ' |');
-  } else {
-    spaced = '';
-    for (let i = 0; i < row.length; i++) {
-      const ch = row[i];
-      if (ch !== '|') {
-        spaced += ch;
-        continue;
-      }
-      let slashes = 0;
-      for (let j = i - 1; j >= 0 && row[j] === '\\'; j--) slashes++;
-      spaced += slashes % 2 === 1 ? '|' : ' |';
+    const cells = row.split('|');
+    if (cells.length > 0 && !cells[0].trim()) cells.shift();
+    if (cells.length > 0 && !cells[cells.length - 1].trim()) cells.pop();
+    if (count !== undefined) {
+      if (cells.length > count) cells.splice(count);
+      while (cells.length < count) cells.push('');
     }
+    for (let i = 0; i < cells.length; i++) cells[i] = cells[i].trim();
+    return cells;
+  }
+  let spaced = '';
+  for (let i = 0; i < row.length; i++) {
+    const ch = row[i];
+    if (ch !== '|') {
+      spaced += ch;
+      continue;
+    }
+    let slashes = 0;
+    for (let j = i - 1; j >= 0 && row[j] === '\\'; j--) slashes++;
+    spaced += slashes % 2 === 1 ? '|' : ' |';
   }
   const cells = spaced.split(' |');
   if (cells.length > 0 && !cells[0].trim()) cells.shift();
@@ -188,8 +192,7 @@ function splitTableCells(row, count) {
     while (cells.length < count) cells.push('');
   }
   for (let i = 0; i < cells.length; i++) {
-    const trimmed = cells[i].trim();
-    cells[i] = trimmed.includes('\\') ? trimmed.replace(/\\\|/g, '|') : trimmed;
+    cells[i] = cells[i].trim().replace(/\\\|/g, '|');
   }
   return cells;
 }
@@ -197,6 +200,7 @@ function splitTableCells(row, count) {
 // Unescape backslash-escaped punctuation (\" -> ", \\ -> \, ...).
 const ESCAPED_PUNCT = /\\([\p{P}\p{S}])/gu;
 function unescapePunct(text) {
+  if (!text.includes('\\')) return text;
   return text.replace(ESCAPED_PUNCT, '$1');
 }
 
@@ -205,22 +209,49 @@ function unescapePunct(text) {
 // ---------------------------------------------------------------------
 
 const PUNCT_SPACE_RE = /^[\s\p{P}\p{S}]$/u; // whitespace, punctuation or symbol
+const PUNCT_SYMBOL_RE = /^[\p{P}\p{S}]$/u; // punctuation or symbol
 const ALNUM_RE = /[\p{L}\p{N}]/u;
-const PUNCT_ONLY_RE = /^[\p{P}\p{S}]$/u; // punctuation or symbol only
-const SPACE_ONLY_RE = /^\s$/u;
-// The ASCII subset of \p{P}\p{S} as a table (hot-path classification
-// of the code point after a delimiter run).
-const ASCII_PUNCT_TABLE = new Uint8Array(128);
-for (const ch of "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~") {
-  ASCII_PUNCT_TABLE[ch.charCodeAt(0)] = 1;
+
+// Is this code point a JS \s whitespace?
+function isSpaceCp(cp) {
+  if (cp < 128) return cp === 32 || (cp >= 9 && cp <= 13);
+  return (
+    cp === 0xa0 ||
+    cp === 0x1680 ||
+    (cp >= 0x2000 && cp <= 0x200a) ||
+    cp === 0x2028 ||
+    cp === 0x2029 ||
+    cp === 0x202f ||
+    cp === 0x205f ||
+    cp === 0x3000 ||
+    cp === 0xfeff
+  );
 }
-function isPunctCp(cp, cpStr) {
-  return cp < 128 ? ASCII_PUNCT_TABLE[cp] === 1 : PUNCT_ONLY_RE.test(cpStr);
+
+// Is this code point a Unicode punctuation or symbol (\p{P}\p{S})?
+// Every printable ASCII character that is not alphanumeric is one,
+// so only non-ASCII characters need the regex.
+function isPunctSymbolCp(cp, ch) {
+  if (cp < 128) {
+    return (
+      cp >= 33 &&
+      cp <= 126 &&
+      !((cp >= 48 && cp <= 57) || (cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122))
+    );
+  }
+  return PUNCT_SYMBOL_RE.test(ch);
 }
-function isSpaceCp(cp, cpStr) {
-  return cp < 128
-    ? cp === 32 || (cp >= 9 && cp <= 13)
-    : SPACE_ONLY_RE.test(cpStr);
+
+// Is this single-code-point string a Unicode letter or number?
+function isAlnumChar(ch) {
+  if (!ch) return false;
+  const cp = ch.codePointAt(0);
+  if (cp < 128) {
+    return (
+      (cp >= 48 && cp <= 57) || (cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122)
+    );
+  }
+  return ALNUM_RE.test(ch);
 }
 
 // The reference's "punctuation" test for the character before a
@@ -229,7 +260,8 @@ function isSpaceCp(cp, cpStr) {
 function isPunctSpaceNotDelim(ch) {
   if (!ch || ch === '*' || ch === '_') return false;
   const cp = ch.codePointAt(0);
-  return isSpaceCp(cp, ch) || isPunctCp(cp, ch);
+  if (cp < 128) return isSpaceCp(cp) || isPunctSymbolCp(cp, ch);
+  return PUNCT_SPACE_RE.test(ch);
 }
 
 // Is this char a Unicode whitespace (JS \s)?
@@ -298,16 +330,9 @@ const REFLINK_SEARCH_RE = new RegExp(
   'g',
 );
 const BLOCK_SKIP_RE =
-  /\[(?:[^\[\]`]|(?<qa>`+)[^`]+\k<qa>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)|<(?! )[^<>]*?>/g;
-// The escape alternative lists the ASCII punctuation/symbol set
-// explicitly (exactly the ASCII subset of \p{P}\p{S}): it keeps this
-// hot scan out of Unicode mode. A backslash before a non-ASCII
-// punctuation or symbol is left unmasked, which the mask's consumers
-// cannot observe: those characters classify identically to the '+'
-// fill (punctuation class, never a delimiter, never whitespace) and
-// start no construct for the later mask passes.
+  /\[(?:[^\[\]`]|(?<qa>`+)[^`]+\k<qa>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)|(?<!`)()(?<qb>`+)[^`]+\k<qb>(?!`)|<(?! )[^<>]*?>/g;
 const ESC_OR_CODE_RE =
-  /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])/g;
+  /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
 
 const LINK_RE = new RegExp(
   '^!?\\[(' +
@@ -364,76 +389,72 @@ function maskReflink(match) {
 
 function buildMask(src) {
   let t = src;
-  // Every reflink match contains a ']', so without one (or without
-  // any link definitions at all) the pass is a guaranteed no-op.
-  // (A fancier "does any reference resolve" pre-scan was tried and
-  // measured slower than the pass it saved — the regex scan itself
-  // is cheap when matches are rare.)
-  if (src.includes('[') && src.includes(']') && DEFS_EXIST) {
+  if (src.includes('[') && DEFS_EXIST) {
     t = t.replace(REFLINK_SEARCH_RE, maskReflink);
   }
   if (src.includes('`') || src.includes('\\')) {
     t = t.replace(ESC_OR_CODE_RE, (whole, codeRun, escPunct) => {
       if (escPunct !== undefined) return '+'.repeat(whole.length);
       if (codeRun !== undefined) {
-        // Hide the span's interior backticks AND any delimiter chars
-        // in its content: with delimiters inside code spans already
-        // blanked here, the block-skip pass below needs no code-span
-        // alternative of its own. (The mask's consumers only observe
-        // delimiter runs and character classes; '`' at the span
-        // boundary is punctuation-class, like the '[' / ']' the
-        // block-skip fill would have put there.) Most spans contain
-        // none of those chars and pass through untouched — detect
-        // that without slicing: the runs are pure backticks, so a
-        // delimiter anywhere in the match is in the content, and an
-        // interior backtick is one past the opening run that is not
-        // part of the closing run.
-        if (
-          !whole.includes('*') &&
-          !whole.includes('_') &&
-          !whole.includes('~') &&
-          whole.indexOf('`', codeRun.length) >= whole.length - codeRun.length
-        ) {
-          return whole;
-        }
-        const content = whole.slice(codeRun.length, whole.length - codeRun.length);
-        return codeRun + content.replace(/[`*_~]/g, '+') + codeRun;
+        // The interior backticks must be blanked; a plain span whose
+        // interior holds no backtick (the first backtick after the
+        // opening run is the closing run itself) needs no rebuild.
+        const innerEnd = whole.length - codeRun.length;
+        if (whole.indexOf('`', codeRun.length) >= innerEnd) return whole;
+        return (
+          codeRun +
+          whole.slice(codeRun.length, innerEnd).replace(/`/g, '+') +
+          codeRun
+        );
       }
       return whole;
     });
   }
-  // BLOCK_SKIP_RE can only change anything the mask's consumers can
-  // observe through an inline link (needs the adjacent pair '](') or
-  // a tag (needs a '<' with a '>' somewhere after it). Code spans
-  // need no blanking here: the pass above already hid their interior
-  // delimiters, and the rest of a span is invisible to the closer
-  // scans (no delimiter inside; boundary chars are punctuation in
-  // both versions).
-  if (src.includes('](') || (src.includes('<') && src.includes('>'))) {
+  // The block-skip pass can only match an inline link (needs ']('),
+  // a code span (needs '`') or a tag (needs '<'); the earlier passes
+  // never create those characters, so when none is present in the
+  // text the pass is a no-op and can be skipped.
+  if (t.includes('](') || t.includes('`') || t.includes('<')) {
     t = t.replace(BLOCK_SKIP_RE, (whole) => '[' + 'a'.repeat(whole.length - 2) + ']');
   }
   return t;
 }
 
-// The last index in the masked text where a run of the delimiter
-// char `d` starts and the preceding char is not whitespace — the
-// last place a closing delimiter could live. Computed per delimiter,
-// lazily, by searching backwards from the end: in real text the last
-// run almost always qualifies, so this is a couple of native
-// searches instead of a full scan of the mask for all three chars.
-function computeLastCloser(masked, d) {
-  let p = masked.lastIndexOf(d);
-  while (p !== -1) {
-    let s = p;
-    while (s > 0 && masked[s - 1] === d) s--;
-    const prev = s === 0 ? '\n' : masked[s - 1];
-    if (prev !== ' ' && prev !== '\t' && prev !== '\n' && prev !== '\r' && prev !== '\f') {
+// The last index in the masked text where a run of `delim` starts and
+// the preceding char is not whitespace — the last place a closing
+// delimiter could live. Computed lazily per delimiter (most inline
+// runs only ever need one of the three), by walking runs backwards
+// from the last occurrence.
+function lastCloserPos(masked, delim) {
+  let i = masked.lastIndexOf(delim);
+  while (i !== -1) {
+    let s = i;
+    while (s > 0 && masked[s - 1] === delim) s--;
+    if (s === 0) return 0;
+    const prev = masked[s - 1];
+    if (
+      prev !== ' ' &&
+      prev !== '\t' &&
+      prev !== '\n' &&
+      prev !== '\r' &&
+      prev !== '\f'
+    ) {
       return s;
     }
-    if (s === 0) return -1;
-    p = masked.lastIndexOf(d, s - 2);
+    i = masked.lastIndexOf(delim, s - 1);
   }
   return -1;
+}
+
+// Resolve the last-closer position for `delim` from the per-scan
+// cache (values are -2 while unknown, then a position or -1).
+function closerFor(closers, masked, delim) {
+  let pos = closers[delim];
+  if (pos === -2) {
+    pos = lastCloserPos(masked, delim);
+    closers[delim] = pos;
+  }
+  return pos;
 }
 
 // --- Individual inline tokenizers ------------------------------------
@@ -526,7 +547,7 @@ function outputLink(cap, href, title, raw) {
 
 function tokLink(rest) {
   if (!STATE.linkParenPossible) return null;
-  // An inline link's matched text always contains the pair ']('.
+  // Native pre-gate: an inline link needs the literal ']('.
   if (!rest.includes('](')) return null;
   const cap = LINK_RE.exec(rest);
   if (!cap) return null;
@@ -561,12 +582,11 @@ function tokLink(rest) {
 }
 
 function tokReflink(rest) {
-  // Necessary conditions first: a reference link contains '][', a
-  // shortcut reference at least a ']'. Skip the big patterns when
-  // they cannot possibly match.
+  // Native pre-gate: a full reference link needs the literal '][';
+  // without it only the collapsed/shortcut form can match.
   const cap =
     (rest.includes('][') ? REFLINK_RE.exec(rest) : null) ||
-    (rest.includes(']') ? NOLINK_RE.exec(rest) : null);
+    NOLINK_RE.exec(rest);
   if (!cap) return null;
   const isImage = cap[0].charAt(0) === '!';
   if (labelHasLongTag(rest, cap[1], isImage ? 2 : 1)) return null;
@@ -586,45 +606,45 @@ function tokReflink(rest) {
 // This reproduces the reference's delimiter-run semantics, including
 // its rule-of-three check for embedded openers.
 
-// The closer patterns are used with lastIndex on the full masked
-// string (no sliced copy). Their original first alternative was
-// anchored with ^, i.e. it may only match as the very first match of
-// a scan, at the scan's start; it is therefore split out into the
-// sticky ALT1 patterns, tried once at the scan start, and the main
-// patterns keep the remaining alternatives (the split alternative
-// has no capture groups, so group numbers are unchanged).
+// The closer scans run in place over the full masked text. Each
+// pattern's first alternative is anchored to the scan start and
+// captures nothing (a match only advances the scan), so it is split
+// off as a sticky probe tried once at the scan position; the main
+// patterns keep the remaining alternatives (group numbering is
+// unchanged: the first alternatives contain no capture groups).
+const EM_ALT1_AST_RE = /[^_*]*?__[^_*]*?\*[^_*]*?(?=__)/uy;
+const EM_ALT1_UND_RE = /[^_*]*?\*\*[^_*]*?_[^_*]*?(?=\*\*)/uy;
 const EM_RDELIM_AST_RE =
   /[^*]+(?=[^*])|(?!\*)(?!~)[\p{P}\p{S}](\*+)(?=[\s]|$)|(?:[^\s\p{P}\p{S}]|~)(\*+)(?!\*)(?=(?!~)[\s\p{P}\p{S}]|$)|(?!\*)(?!~)[\s\p{P}\p{S}](\*+)(?=(?:[^\s\p{P}\p{S}]|~))|[\s](\*+)(?!\*)(?=(?!~)[\p{P}\p{S}])|(?!\*)(?!~)[\p{P}\p{S}](\*+)(?!\*)(?=(?!~)[\p{P}\p{S}])|(?:[^\s\p{P}\p{S}]|~)(\*+)(?=(?:[^\s\p{P}\p{S}]|~))/gu;
 const EM_RDELIM_UND_RE =
   /[^_]+(?=[^_])|(?!_)[\p{P}\p{S}](_+)(?=[\s]|$)|[^\s\p{P}\p{S}](_+)(?!_)(?=[\s\p{P}\p{S}]|$)|(?!_)[\s\p{P}\p{S}](_+)(?=[^\s\p{P}\p{S}])|[\s](_+)(?!_)(?=[\p{P}\p{S}])|(?!_)[\p{P}\p{S}](_+)(?!_)(?=[\p{P}\p{S}])/gu;
-const EM_ALT1_AST_RE = /[^_*]*?__[^_*]*?\*[^_*]*?(?=__)/yu;
-const EM_ALT1_UND_RE = /[^_*]*?\*\*[^_*]*?_[^_*]*?(?=\*\*)/yu;
 
 function tokEmStrong(rest, masked, prevChar, closers) {
-  // Opener classification, hand-rolled from EM_LDELIM_RE (whose
-  // Unicode-mode exec was a hot spot): the delimiter run, then
-  // optionally one more code point — a punctuation/symbol char other
-  // than the delimiter and '~' (cap1/cap3), else any non-whitespace
-  // char other than the delimiter (cap2/cap4). No group, no opener.
+  // Hand-rolled opener classification (was EM_LDELIM_RE): the run of
+  // delimiters at the start of rest, then the code point after it —
+  // afterPunct when it is a punctuation/symbol other than the
+  // delimiter and '~', afterOther when it is any other non-whitespace
+  // char. Both empty (run at end of text or followed by whitespace)
+  // means no emphasis can start here.
   const delim = rest[0];
-  const dcode = rest.charCodeAt(0);
-  let rl = 1;
-  while (rest.charCodeAt(rl) === dcode) rl++;
-  let cap1, cap2, cap3, cap4;
-  if (rl < rest.length) {
-    const cp = rest.codePointAt(rl);
-    // The caps are only tested for truthiness and passed to the
-    // class tests (which need the real string only for cp >= 128).
-    const cpStr = cp < 128 ? rest[rl] : String.fromCodePoint(cp);
-    if (delim === '*') {
-      if (isPunctCp(cp, cpStr) && cp !== 42 && cp !== 126) cap1 = cpStr;
-      else if (!isSpaceCp(cp, cpStr) && cp !== 42) cap2 = cpStr;
+  let openerRun = 0;
+  while (rest[openerRun] === delim) openerRun++;
+  let afterPunct = '';
+  let afterOther = '';
+  const cpAfter = rest.codePointAt(openerRun);
+  if (cpAfter !== undefined && !isSpaceCp(cpAfter)) {
+    const chAfter = String.fromCodePoint(cpAfter);
+    if (
+      chAfter !== delim &&
+      chAfter !== '~' &&
+      isPunctSymbolCp(cpAfter, chAfter)
+    ) {
+      afterPunct = chAfter;
     } else {
-      if (isPunctCp(cp, cpStr) && cp !== 95 && cp !== 126) cap3 = cpStr;
-      else if (!isSpaceCp(cp, cpStr) && cp !== 95) cap4 = cpStr;
+      afterOther = chAfter;
     }
   }
-  if (!cap1 && !cap2 && !cap3 && !cap4) return null;
+  if (!afterPunct && !afterOther) return null;
   const sameAsPrev = prevChar === delim;
   const posInFull = masked.length - rest.length;
   let runStart = posInFull;
@@ -650,12 +670,10 @@ function tokEmStrong(rest, masked, prevChar, closers) {
   const flanking = runStart < posInFull
     ? beforeIsDelimOrPunct
     : isPunctSpaceNotDelim(prev);
-  if (cap4 && ALNUM_RE.test(prev)) return null;
-  const afterPunct = cap1 || cap3 || '';
+  if (delim === '_' && afterOther && isAlnumChar(prev)) return null;
   if (!afterPunct || !prev || flanking) {
-    // openLen: the delimiter run length (the classification match is
-    // the run plus at most one more code point, never a delimiter).
-    let openLen = rl;
+    // openLen: the delimiter run length.
+    const openLen = openerRun;
     let debt = openLen;
     let skipped = 0;
     const openerTotal = posInFull - runStart + openLen;
@@ -663,31 +681,25 @@ function tokEmStrong(rest, masked, prevChar, closers) {
       !!before.trim() &&
       (!!afterPunct || (delim === '*' && !beforeIsDelimOrPunct));
     const afterOpener = posInFull + openLen;
-    const lastCloser = closers ? closers[delim] : -1;
+    const lastCloser = closerFor(closers, masked, delim);
     if (lastCloser < afterOpener) return null;
-    // Scan the masked string in place from afterOpener (the closer
-    // patterns match the same suffix the old code sliced out, with
-    // match indices offset by afterOpener). The split-out first
-    // alternative may only match at the scan start: try it once,
-    // sticky, and let the main pattern continue from its end.
+    const maxIndex = lastCloser - afterOpener;
     const rdelim = delim === '*' ? EM_RDELIM_AST_RE : EM_RDELIM_UND_RE;
+    // In-place scan over the full masked text: the anchored first
+    // alternative is probed stickily at the scan start (a match only
+    // advances the scan), then the main pattern runs from there.
+    // Match indices below are relative to afterOpener, as they were
+    // relative to the sliced scan string before.
+    let scanPos = afterOpener;
     const alt1 = delim === '*' ? EM_ALT1_AST_RE : EM_ALT1_UND_RE;
     alt1.lastIndex = afterOpener;
-    let pending = alt1.exec(masked);
-    if (pending && pending.index !== afterOpener) pending = null;
-    rdelim.lastIndex = afterOpener;
+    const a1 = alt1.exec(masked);
+    if (a1) scanPos = afterOpener + a1[0].length;
+    rdelim.lastIndex = scanPos;
     let m;
-    while (true) {
-      if (pending) {
-        m = pending;
-        pending = null;
-        rdelim.lastIndex = afterOpener + m[0].length;
-      } else {
-        m = rdelim.exec(masked);
-        if (!m) break;
-      }
-      if (m.index > lastCloser) break;
+    while ((m = rdelim.exec(masked)) !== null) {
       const relIndex = m.index - afterOpener;
+      if (relIndex > maxIndex) break;
       const run = m[1] || m[2] || m[3] || m[4] || m[5] || m[6];
       if (!run) continue;
       let runLen = run.length;
@@ -724,53 +736,51 @@ function tokEmStrong(rest, masked, prevChar, closers) {
   return null;
 }
 
+// Split like the emphasis patterns: the anchored, capture-less
+// first alternative becomes a sticky probe; the main pattern keeps
+// the rest (group numbering unchanged).
+const DEL_ALT1_RE = /[^~]+(?=[^~])/uy;
 const DEL_RDELIM_RE =
   /(?!~)[\p{P}\p{S}](~~?)(?=[\s]|$)|[^\s\p{P}\p{S}](~~?)(?!~)(?=[\s\p{P}\p{S}]|$)|(?!~)[\s\p{P}\p{S}](~~?)(?=[^\s\p{P}\p{S}])|[\s](~~?)(?!~)(?=[\p{P}\p{S}])|(?!~)[\p{P}\p{S}](~~?)(?!~)(?=[\p{P}\p{S}])|[^\s\p{P}\p{S}](~~?)(?=[^\s\p{P}\p{S}])/gu;
-const DEL_ALT1_RE = /[^~]+(?=[^~])/y;
 
 function tokDel(rest, masked, prevChar, closers) {
-  // Opener classification, hand-rolled from DEL_LDELIM_RE: one or
-  // two '~', then a required code point that is neither '~' nor
-  // whitespace (the pattern's two alternatives together cover every
-  // non-space char). No such code point, no opener. cap1 mirrors the
-  // pattern's capture group exactly: it is set ONLY when that code
-  // point is punctuation/symbol — the scan-entry test below depends
-  // on the distinction (a letter/digit after the run leaves cap1
-  // unset, which is what lets a mid-word opener like H~2~O scan).
-  const openLen = rest.charCodeAt(1) === 126 ? 2 : 1;
-  let hasOpener = false;
-  let cap1;
-  if (openLen < rest.length) {
-    const cp = rest.codePointAt(openLen);
-    const cpStr = cp < 128 ? rest[openLen] : String.fromCodePoint(cp);
-    if (cp !== 126 && !isSpaceCp(cp, cpStr)) {
-      hasOpener = true;
-      if (isPunctCp(cp, cpStr)) cap1 = cpStr;
-    }
+  // Hand-rolled opener classification (was DEL_LDELIM_RE): a run of
+  // one or two '~' (the regex prefers two and backtracks to one) plus
+  // the code point after it. afterPunct is that code point ONLY when
+  // it is a punctuation/symbol — a letter or digit after the run (as
+  // in H~2~O) is captured by the regex's second alternative and does
+  // NOT count as afterPunct. No classification at all (run followed
+  // by '~', whitespace, or the end of the text) means no match.
+  let openLen = 0;
+  let afterPunct = '';
+  const maxRun = rest.charCodeAt(1) === 126 ? 2 : 1;
+  for (let run = maxRun; run >= 1; run--) {
+    const cp = rest.codePointAt(run);
+    if (cp === undefined || cp === 126 || isSpaceCp(cp)) continue;
+    const ch = String.fromCodePoint(cp);
+    afterPunct = isPunctSymbolCp(cp, ch) ? ch : '';
+    openLen = run;
+    break;
   }
-  if (!hasOpener) return null;
-  if (!cap1 || !prevChar || isPunctSpaceNotDelim(prevChar)) {
+  if (openLen === 0) return null;
+  if (!afterPunct || !prevChar || isPunctSpaceNotDelim(prevChar)) {
     let debt = openLen;
     const afterOpener = masked.length - rest.length + openLen;
-    const lastCloser = closers ? closers['~'] : -1;
+    const lastCloser = closerFor(closers, masked, '~');
     if (lastCloser < afterOpener) return null;
-    // In-place scan of the masked suffix, as in tokEmStrong.
+    const maxIndex = lastCloser - afterOpener;
+    // In-place scan over the full masked text, like tokEmStrong:
+    // sticky probe for the anchored first alternative, then the
+    // main pattern; indices are relative to afterOpener.
+    let scanPos = afterOpener;
     DEL_ALT1_RE.lastIndex = afterOpener;
-    let pending = DEL_ALT1_RE.exec(masked);
-    if (pending && pending.index !== afterOpener) pending = null;
-    DEL_RDELIM_RE.lastIndex = afterOpener;
+    const a1 = DEL_ALT1_RE.exec(masked);
+    if (a1) scanPos = afterOpener + a1[0].length;
+    DEL_RDELIM_RE.lastIndex = scanPos;
     let m;
-    while (true) {
-      if (pending) {
-        m = pending;
-        pending = null;
-        DEL_RDELIM_RE.lastIndex = afterOpener + m[0].length;
-      } else {
-        m = DEL_RDELIM_RE.exec(masked);
-        if (!m) break;
-      }
-      if (m.index > lastCloser) break;
+    while ((m = DEL_RDELIM_RE.exec(masked)) !== null) {
       const relIndex = m.index - afterOpener;
+      if (relIndex > maxIndex) break;
       const run = m[1] || m[2] || m[3] || m[4] || m[5] || m[6];
       if (!run) continue;
       let runLen = run.length;
@@ -793,27 +803,9 @@ function tokDel(rest, masked, prevChar, closers) {
 }
 
 function tokCodespan(rest) {
-  // A code span needs a closing run of exactly the opening run's
-  // length later on (the pattern's content must start and end with a
-  // non-backtick, which run maximality guarantees for the first such
-  // run). Find it with native searches; without one the lazy pattern
-  // would scan to the end of the text before failing.
-  {
-    let k = 1;
-    while (rest.charCodeAt(k) === 96) k++;
-    let found = false;
-    let p = rest.indexOf('`', k);
-    while (p !== -1) {
-      let L = 1;
-      while (rest.charCodeAt(p + L) === 96) L++;
-      if (L === k) {
-        found = true;
-        break;
-      }
-      p = rest.indexOf('`', p + L);
-    }
-    if (!found) return null;
-  }
+  // Native pre-gate: a code span needs a closing backtick run, so at
+  // least one more backtick must exist after the opening run starts.
+  if (rest.indexOf('`', 1) === -1) return null;
   const cap = CODESPAN_RE.exec(rest);
   if (!cap) return null;
   let text = cap[2].replace(/\n/g, ' ');
@@ -953,13 +945,10 @@ function spacesThenNewline(s, i) {
 // character, a hard-break space run, an http/ftp/www prefix, a
 // mailto:/xmpp: scheme, or the '@' of a possible email. The scan
 // jumps from candidate to candidate (native regex search) and
-// verifies each one precisely.
-// Case variants are written out as classes instead of using /i:
-// the fold partners of these ASCII letters are ASCII-only, so this
-// matches exactly the same candidates, and a case-sensitive scan is
-// cheaper in the engine's inner loop. (The branch code below still
-// verifies the exact lowercase forms where the semantics require
-// them, exactly as it did when /i produced the candidate.)
+// verifies each one precisely. Case-insensitive prefixes are spelled
+// with explicit ASCII case classes instead of the /i flag (the
+// verifier below accepts only the exact lowercase forms where the
+// reference does, and the flag makes the native scan slower).
 const TEXT_CANDIDATE_RE =
   /[\\<!\[`*~_]| {2,}\n|[hH][tT][tT][pP]|[fF][tT][pP]:\/\/|[wW][wW][wW]\.|[mM][aA][iI][lL][tT][oO]:|[xX][mM][pP][pP]:|@/g;
 
@@ -967,14 +956,13 @@ function tokInlineText(rest) {
   const s = rest;
   const n = s.length;
   let i = 0;
-  // Email lookahead state: atPos is the index of the '@' of the
+  // Memoized email lookahead: atPos is the index of the '@' of the
   // next candidate email at or after the scan position, atStart the
   // start of the email-character run that ends at that '@'. An email
-  // starts at p exactly when atStart <= p < atPos. (Plain locals,
-  // open-coded at the use sites: this function runs per text run, so
-  // per-call closure allocations are worth avoiding.)
+  // starts at p exactly when atStart <= p < atPos.
   let atPos = -1;
   let atStart = -1;
+  let atSearched = false;
   const c0 = s.charCodeAt(0);
   if (
     !isAlnumCode(c0) &&
@@ -993,20 +981,27 @@ function tokInlineText(rest) {
     const c = s.charCodeAt(i);
     if (c === 96 || c === 126) return makeTextToken(s.slice(0, i));
     if (spacesThenNewline(s, i)) return makeTextToken(s.slice(0, i));
-    // Does an email start at i? The lookahead state stays live for
-    // the candidate loop's '@' branch below.
-    atPos = s.indexOf('@', i);
-    if (atPos !== -1) {
-      atStart = atPos;
-      while (atStart > 0 && isEmailLocalAt(s, atStart - 1)) atStart--;
-      if (i >= atStart && i < atPos) return makeTextToken(s.slice(0, i));
+    // Does an email start at i? (open-coded lookahead over the
+    // memoized atPos/atStart state declared above)
+    if (!atSearched || i > atPos) {
+      atPos = s.indexOf('@', i);
+      atSearched = true;
+      if (atPos === -1) {
+        atStart = -1;
+      } else {
+        atStart = atPos;
+        while (atStart > 0 && isEmailLocalAt(s, atStart - 1)) atStart--;
+      }
+    }
+    if (atPos !== -1 && i >= atStart && i < atPos) {
+      return makeTextToken(s.slice(0, i));
     }
   }
   // The next email that starts inside this run, if any: an email
   // terminator's effective end is the START of the local-part run
   // ending at the '@', which can precede other candidates (a '_'
   // inside the local part is itself a candidate). Tracked lazily in
-  // these two locals and resolved open-coded at the single use site.
+  // plain locals and open-coded at its single use in the loop below.
   let nextAtPos = -2; // -2 unknown, -1 none
   let nextAtStart = -1;
   // Jump between candidate end positions.
@@ -1024,6 +1019,7 @@ function tokInlineText(rest) {
         if (atPos !== q) {
           atPos = q;
           atStart = q;
+          atSearched = true;
           while (atStart > 0 && isEmailLocalAt(s, atStart - 1)) atStart--;
         }
         if (atStart > i) {
@@ -1057,9 +1053,8 @@ function tokInlineText(rest) {
       end = q;
     }
     if (end !== -1) {
-      // Resolve the email terminator for this end position: the
-      // start of the first email whose local-part run begins after
-      // the run start i and at or before end, else -1.
+      // Open-coded emailEndUpTo(end): the start of the local-part
+      // run of the next email beginning at or before `end`, else -1.
       let ee = -1;
       for (;;) {
         if (nextAtPos === -1) break;
@@ -1125,14 +1120,12 @@ function inlineTokens(src, tokens) {
 }
 
 function scanInline(src, tokens) {
-  // The emphasis mask is computed lazily: many inline runs never
-  // reach an emphasis tokenizer (their *, _ or ~ characters all live
-  // inside code spans, links or tags). The last-closer position is
-  // computed lazily per delimiter char, only when one is scanned
-  // for. (Plain locals, no helper closures: this runs ~50k times per
-  // practice set, so per-call allocations are worth avoiding.)
+  // The emphasis mask is computed lazily: many inline runs never reach
+  // an emphasis tokenizer (their *, _ or ~ characters all live inside
+  // code spans, links or tags). Last-closer positions are likewise
+  // resolved per delimiter on first use and cached in plain locals.
   let masked = null;
-  let closers = null;
+  const closers = { '*': -2, _: -2, '~': -2 };
   let prevChar = '';
   let wasText = false;
   let rest = src;
@@ -1176,9 +1169,6 @@ function scanInline(src, tokens) {
     } else if (c === 42 || c === 95) {
       // * or _: emphasis; a leading _ can also start a bare email URL
       if (masked === null) masked = buildMask(src);
-      if (closers === null) closers = { '*': undefined, _: undefined, '~': undefined };
-      const d = rest[0];
-      if (closers[d] === undefined) closers[d] = computeLastCloser(masked, d);
       tok = tokEmStrong(rest, masked, prevChar, closers);
       if (!tok && c === 95 && !STATE.inLink) tok = tokUrl(rest);
     } else if (c === 96) {
@@ -1187,8 +1177,6 @@ function scanInline(src, tokens) {
     } else if (c === 126) {
       // ~: strikethrough
       if (masked === null) masked = buildMask(src);
-      if (closers === null) closers = { '*': undefined, _: undefined, '~': undefined };
-      if (closers['~'] === undefined) closers['~'] = computeLastCloser(masked, '~');
       tok = tokDel(rest, masked, prevChar, closers);
     } else if (c === 32) {
       // space: a hard break is the only construct that can start here
@@ -1200,8 +1188,7 @@ function scanInline(src, tokens) {
     if (tok) {
       tokens.push(tok);
     } else if ((tok = tokInlineText(rest))) {
-      const lastCh = tok.raw.charAt(tok.raw.length - 1);
-      if (lastCh !== '_') prevChar = lastCh;
+      if (!tok.raw.endsWith('_')) prevChar = tok.raw.slice(-1);
       wasText = true;
       const prevTok = tokens[tokens.length - 1];
       if (prevTok && prevTok.type === 'text') {
@@ -1377,16 +1364,31 @@ function tokDef(src) {
 function matchTableStart(src, ls) {
   const nl = src.indexOf('\n', ls);
   if (nl === -1) return null;
-  // The delimiter row must begin (after at most 3 spaces) with '|',
-  // ':' or '-' — TABLE_DELIM_RE requires a dash run right there.
-  // Reject before slicing anything; nearly every paragraph line
-  // fails this test.
-  let dp = nl + 1;
-  for (let k = 0; k < 3 && src[dp] === ' '; k++) dp++;
-  const dc = src[dp];
-  if (dc !== '|' && dc !== ':' && dc !== '-') return null;
   const header = src.slice(ls, nl);
-  if (!/^ *[^\n ]/.test(header)) return null;
+  // The header line must have a non-space character (hand test for
+  // /^ *[^\n ]/ on a single line).
+  let hi = 0;
+  while (hi < header.length && header[hi] === ' ') hi++;
+  if (hi >= header.length) return null;
+  // Cheap pre-gate for the delimiter line: TABLE_DELIM_RE can only
+  // match a line of at most 3 leading spaces whose characters are all
+  // in { ' ', '|', ':', '-' } (the match must consume the whole line)
+  // and which contains at least one '-'. Reject anything else here
+  // without slicing or running the regex.
+  let d = nl + 1;
+  let lead = 0;
+  while (src[d] === ' ') {
+    d++;
+    lead++;
+    if (lead > 3) return null;
+  }
+  let hasDash = false;
+  for (; d < src.length && src[d] !== '\n'; d++) {
+    const c = src[d];
+    if (c === '-') hasDash = true;
+    else if (c !== '|' && c !== ':' && c !== ' ') return null;
+  }
+  if (!hasDash) return null;
   const dm = TABLE_DELIM_RE.exec(src.slice(nl + 1));
   if (!dm) return null;
   return { header, delim: dm[1], afterDelim: nl + 1 + dm[0].length };
@@ -1464,7 +1466,6 @@ const LH_BLOCK_BULLET_RE = /^ {0,3}(?:[*+-]|\d{1,9}[.)]) /;
 const LH_BLOCK_FENCE_RE = /^ {0,3}(?:`{3,}|~{3,})/;
 const LH_BLOCK_TAG_RE = /^ {0,3}<[^\n>]+\>\n/;
 const LH_BLOCK_TABLE_RE = /^ {0,3}\|?(?:[:\- ]*\|)+[\:\- ]*\n/;
-const LH_UNDERLINE_RE = /^ {0,3}(=+|-+)[ \t]*(?:\n+|$)/;
 
 function lheadingBlockedAt(src, ls) {
   const rest = src.slice(ls);
@@ -1505,12 +1506,32 @@ function lheadingMatch(src) {
   }
   let nl = src.indexOf('\n');
   while (nl !== -1) {
-    const um = LH_UNDERLINE_RE.exec(src.slice(nl + 1));
-    if (um && nl > 0) {
+    // Hand scan for the setext underline at nl + 1 (was
+    // LH_UNDERLINE_RE.exec on a slice): up to 3 spaces, a run of one
+    // of '=' / '-', trailing spaces/tabs, then newlines or the end.
+    let d = nl + 1;
+    let sp = 0;
+    while (src[d] === ' ') {
+      d++;
+      sp++;
+    }
+    let umLen = -1;
+    let umEq = false;
+    if (sp <= 3 && (src[d] === '=' || src[d] === '-')) {
+      const uc = src[d];
+      umEq = uc === '=';
+      while (src[d] === uc) d++;
+      while (src[d] === ' ' || src[d] === '\t') d++;
+      if (d >= src.length || src[d] === '\n') {
+        while (src[d] === '\n') d++;
+        umLen = d - (nl + 1);
+      }
+    }
+    if (umLen !== -1 && nl > 0) {
       return {
         text: src.slice(0, nl).trim(),
-        depth: um[1].charAt(0) === '=' ? 1 : 2,
-        raw: rtrimChar(src.slice(0, nl + 1 + um[0].length), '\n'),
+        depth: umEq ? 1 : 2,
+        raw: rtrimChar(src.slice(0, nl + 1 + umLen), '\n'),
       };
     }
     if (lheadingBlockedAt(src, nl + 1)) return null;
@@ -1530,10 +1551,9 @@ function tokLheading(src) {
 
 // The first character of a block that is not a leading space, and how
 // many spaces precede it (block constructs allow at most 3). Returns
-// { ch, spaces } with ch === '' at a blank line or end of input.
-// Shared scratch result: every caller reads the fields before any
-// other call can overwrite them (this runs per block and per list
-// line, so the allocation mattered).
+// { ch, spaces } with ch === '' at a blank line or end of input. The
+// result is a shared scratch object: callers must copy the fields out
+// before any other call (all current callers destructure at once).
 const SIG_SCRATCH = { ch: '', spaces: 0 };
 function firstSigChar(src) {
   let i = 0;
@@ -1703,30 +1723,29 @@ function hasDoubleBlankEnd(s) {
 }
 
 function expandLeadingRun(text, startColumn) {
-  const fc = text.charCodeAt(0);
-  if (fc !== 32 && fc !== 9) return text; // no leading space/tab run
-  // Scan the leading run by hand (this runs per list line; a regex
-  // exec allocates a match array every time).
-  let i = 0;
+  // Hand-scanned equivalent of the /^[ \t]+/ prefix test.
+  let end = 0;
   let hasTab = false;
-  while (i < text.length && (text[i] === ' ' || text[i] === '\t')) {
-    if (text[i] === '\t') hasTab = true;
-    i++;
+  while (end < text.length) {
+    const c = text.charCodeAt(end);
+    if (c === 32) end++;
+    else if (c === 9) {
+      hasTab = true;
+      end++;
+    } else break;
   }
-  if (!hasTab) return text; // spaces expand to themselves
-  return expandTabs(text.slice(0, i), startColumn) + text.slice(i);
+  if (end === 0 || !hasTab) return text; // spaces expand to themselves
+  return expandTabs(text.slice(0, end), startColumn) + text.slice(end);
 }
 
-const BLANK_ONLY_RE = /^\s*$/;
-// Is every character whitespace (the semantics of s.trim() === '')?
-// ASCII fast path; anything non-ASCII defers to the regex, whose \s
-// class covers exactly the characters trim() removes.
-function isBlankStr(s) {
+// Is this string entirely whitespace (String.trim() === ''), tested
+// char by char; non-ASCII characters defer to trim itself.
+function isBlankText(s) {
   for (let i = 0; i < s.length; i++) {
     const c = s.charCodeAt(i);
-    if (c === 32 || c === 9 || c === 10 || c === 12 || c === 11 || c === 13) continue;
-    if (c > 127) return BLANK_ONLY_RE.test(s);
-    return false;
+    if (c === 32 || c === 9 || c === 11 || c === 12 || c === 13) continue;
+    if (c < 128) return false;
+    return s.trim() === '';
   }
   return true;
 }
@@ -1803,6 +1822,8 @@ function tokList(src) {
   if (!startCap) return null;
   const origSrc = src;
   let rest = src;
+  // Consumed length so far is origSrc.length - rest.length, computed
+  // inline at the uses below (no per-call closure).
   const bulletTrimmed = startCap[1].trim();
   const ordered = bulletTrimmed.length > 1;
   const list = {
@@ -1832,7 +1853,7 @@ function tokList(src) {
     const expanded = expandLeadingRun(firstLine, bulletLen);
     const nextNl = rest.indexOf('\n');
     let nextLine = nextNl === -1 ? rest : rest.slice(0, nextNl);
-    const blankFirst = isBlankStr(expanded);
+    const blankFirst = isBlankText(expanded);
     let indent;
     let itemText = '';
     if (blankFirst) {
@@ -1857,13 +1878,10 @@ function tokList(src) {
         const line = lineNl === -1 ? rest : rest.slice(0, lineNl);
         const dedented = expandLeadingRun(line, 0);
         if (beginBreaksAt(line, begin)) break;
-        const lineBlank = isBlankStr(line);
-        if (lineBlank || firstNonSpaceIdx(dedented) >= indent) {
+        if (firstNonSpaceIdx(dedented) >= indent || isBlankText(line)) {
           itemText += '\n' + dedented.slice(indent);
         } else {
-          const prevExpanded = prevDedented.includes('\t')
-            ? prevDedented.replace(/\t/g, '    ')
-            : prevDedented;
+          const prevExpanded = prevDedented.replace(/\t/g, '    ');
           if (
             prevBlank ||
             firstNonSpaceIdx(prevExpanded) >= 4 ||
@@ -1877,7 +1895,7 @@ function tokList(src) {
           }
           itemText += '\n' + add;
         }
-        prevBlank = lineBlank;
+        prevBlank = isBlankText(line);
         rest = rest.slice(line.length + 1);
         prevDedented = dedented.slice(indent);
       }
@@ -2323,8 +2341,8 @@ function renderBlocks(tokens) {
 // ---------------------------------------------------------------------
 
 export function parse(markdown) {
-  const raw = String(markdown);
-  const src = raw.includes('\r') ? raw.replace(/\r\n|\r/g, '\n') : raw;
+  let src = String(markdown);
+  if (src.includes('\r')) src = src.replace(/\r\n|\r/g, '\n');
   LINKS = Object.create(null);
   DEFS_EXIST = false;
   JOBS = [];
